@@ -1,75 +1,89 @@
-
-import os
-import sys
-import pandas as pd
 import json
-import gspread
+import pandas as pd
 from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
-
-# Ensure utils directory is on the path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 from utils.zerodha import get_kite, get_stock_data
 from utils.indicators import calculate_scores
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Setup credentials
+# Connect to Google Sheet
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_dict = json.loads(os.environ["GSPREAD_CREDENTIALS_JSON"])
+creds_dict = json.loads(open("gspread_credentials.json").read())
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Fetch credentials from ZerodhaTokenStore sheet
+# Read API tokens
 token_sheet = client.open("ZerodhaTokenStore").sheet1
-api_key, api_secret, access_token = token_sheet.get_all_values()[0][:3]
+tokens = token_sheet.get_all_values()[0]
+api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
 
-# Initialize Kite (try live, fallback to offline)
-try:
-    kite = get_kite(api_key, access_token)
-    market_live = True
-except Exception as e:
-    print("⚠️ Live mode failed. Switching to offline mode:", e)
-    kite = None
-    market_live = False
+# Initialize Kite Connect
+kite = get_kite(api_key, access_token)
 
-# Define stock list and timeframes
-symbols = [
-    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL",
-    "LT", "KOTAKBANK", "ITC", "HCLTECH", "WIPRO", "AXISBANK", "ASIANPAINT",
-    "BAJFINANCE", "HINDUNILVR", "MARUTI", "SUNPHARMA", "ULTRACEMCO", "TITAN"
-]
+# Read symbols from LiveLTPStore
+symbols = client.open("LiveLTPStore").sheet1.col_values(1)[1:]  # Skip header
+print(f"📦 Total symbols to analyze: {len(symbols)}")
 
+# Timeframes to fetch
 TIMEFRAMES = {
     "15m": {"interval": "15minute", "days": 5},
-    "1d": {"interval": "day", "days": 90},
+    "1d": {"interval": "day", "days": 90}
 }
 
-# Collect data
-all_rows = []
+rows = []
+
 for symbol in symbols:
+    print(f"⏳ Processing {symbol}")
     row = {"Symbol": symbol}
-    for label, config in TIMEFRAMES.items():
-        if market_live:
-            df = get_stock_data(kite, symbol, config["interval"], config["days"])
+
+    try:
+        # Get latest LTP from LiveLTPStore
+        ltp_sheet = client.open("LiveLTPStore").sheet1
+        ltp_data = pd.DataFrame(ltp_sheet.get_all_records())
+        ltp_row = ltp_data[ltp_data["Symbol"] == symbol]
+        ltp = float(ltp_row.iloc[0]["LTP"]) if not ltp_row.empty else None
+        row["LTP"] = ltp
+
+        # Calculate % change from daily close
+        daily_df = get_stock_data(kite, symbol, "day", 2)
+        if not daily_df.empty:
+            last_close = daily_df.iloc[-2]["close"]
+            row["% Change"] = round(((ltp - last_close) / last_close) * 100, 2) if ltp else None
         else:
-            # fallback to dummy data
-            from utils.samples import get_sample_data
-            df = get_sample_data(symbol, config["interval"], config["days"])
+            row["% Change"] = None
 
-        if not df.empty:
-            result = calculate_scores(df)
-            row[f"{label} TMV Score"] = result.get("Total Score", "")
-            row[f"{label} Trend Direction"] = result.get("Trend Direction", "")
-            row[f"{label} Reversal Probability"] = result.get("Reversal Probability", "")
-    all_rows.append(row)
+        # Analyze both timeframes
+        for tf, config in TIMEFRAMES.items():
+            try:
+                df = get_stock_data(kite, symbol, config["interval"], config["days"])
+                if df.empty:
+                    raise Exception("Empty dataframe")
+                scores = calculate_scores(df)
+                row[f"{tf} TMV Score"] = round(scores.get("Total Score", 0), 2)
+                row[f"{tf} Trend Direction"] = scores.get("Trend Direction", "")
+                row[f"{tf} Reversal Probability"] = round(scores.get("Reversal Probability", 0), 2)
+            except:
+                print(f"⚠️ Live data failed for {symbol} [{tf}] — using fallback")
+                row[f"{tf} TMV Score"] = 0
+                row[f"{tf} Trend Direction"] = "Neutral"
+                row[f"{tf} Reversal Probability"] = 0
 
-# Save to Google Sheet
-sheet = client.open("BackgroundAnalysisStore").sheet1
-sheet.clear()
+    except Exception as e:
+        print(f"❌ Skipping {symbol}: {e}")
+        continue
+
+    rows.append(row)
+
+# Write to final Google Sheet
+output_sheet = client.open("BackgroundAnalysisStore").sheet1
+output_sheet.clear()
 headers = [
-    "Symbol", "15m TMV Score", "15m Trend Direction", "15m Reversal Probability",
+    "Symbol", "LTP", "% Change",
+    "15m TMV Score", "15m Trend Direction", "15m Reversal Probability",
     "1d TMV Score", "1d Trend Direction", "1d Reversal Probability"
 ]
-sheet.append_row(headers)
-sheet.append_rows([ [row.get(h, "") for h in headers] for row in all_rows ])
-print("✅ Sheet updated successfully")
+output_sheet.append_row(headers)
+for row in rows:
+    output_sheet.append_row([row.get(h, "") for h in headers])
+
+print("✅ Background analysis updated successfully!")
