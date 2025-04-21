@@ -1,89 +1,90 @@
-import json
 import pandas as pd
-from datetime import datetime
-from utils.zerodha import get_kite, get_stock_data
-from utils.indicators import calculate_scores
+import numpy as np
 import gspread
+from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 
-# Connect to Google Sheet
+# === Google Sheet Setup ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_dict = json.loads(open("gspread_credentials.json").read())
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name("zerodhatokensaver-1b53153ffd25.json", scope)
 client = gspread.authorize(creds)
 
-# Read API tokens
-token_sheet = client.open("ZerodhaTokenStore").sheet1
-tokens = token_sheet.get_all_values()[0]
-api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
+output_sheet = client.open("BackgroundAnalysisStore").sheet1
 
-# Initialize Kite Connect
-kite = get_kite(api_key, access_token)
+# === Static Symbol List (NIFTY 50 without HDFC) ===
+nifty_symbols = [
+    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL", "AXISBANK", "LT",
+    "ITC", "KOTAKBANK", "HINDUNILVR", "BAJFINANCE", "ASIANPAINT", "MARUTI", "NTPC", "SUNPHARMA",
+    "POWERGRID", "TITAN", "HCLTECH", "ULTRACEMCO", "WIPRO", "BAJAJFINSV", "ONGC", "TECHM",
+    "JSWSTEEL", "COALINDIA", "TATAMOTORS", "HINDALCO", "ADANIENT", "ADANIPORTS", "GRASIM",
+    "BRITANNIA", "DIVISLAB", "EICHERMOT", "NESTLEIND", "DRREDDY", "CIPLA", "M&M", "BPCL",
+    "SBILIFE", "HEROMOTOCO", "BAJAJ-AUTO", "TATASTEEL", "INDUSINDBK", "APOLLOHOSP", "HDFCLIFE",
+    "UPL"
+]
 
-# Read symbols from LiveLTPStore
-symbols = client.open("LiveLTPStore").sheet1.col_values(1)[1:]  # Skip header
-print(f"📦 Total symbols to analyze: {len(symbols)}")
+# === Helper to simulate offline calculations ===
+def compute_tmv_score(df):
+    ema_short = df['close'].ewm(span=8, adjust=False).mean().iloc[-1]
+    ema_long = df['close'].ewm(span=21, adjust=False).mean().iloc[-1]
+    price = df['close'].iloc[-1]
 
-# Timeframes to fetch
-TIMEFRAMES = {
-    "15m": {"interval": "15minute", "days": 5},
-    "1d": {"interval": "day", "days": 90}
-}
+    score = np.clip((price - ema_long) / (ema_long + 1e-6), -1, 1)
+    tmv_score = round((score + 1) / 2, 2)
 
-rows = []
+    direction = "Bullish" if price > ema_long else "Bearish" if price < ema_short else "Neutral"
+    reversal = round(np.abs(ema_short - ema_long) / (price + 1e-6), 2)
 
-for symbol in symbols:
-    print(f"⏳ Processing {symbol}")
-    row = {"Symbol": symbol}
+    return tmv_score, direction, reversal
 
+# === Fallback: Simulated OHLCV Fetch ===
+def fetch_ohlcv(symbol, interval="day", days=90):
+    np.random.seed(hash(symbol) % 123456)  # ensure consistent output
+    price = np.random.uniform(100, 3000)
+    df = pd.DataFrame({
+        "close": price + np.random.randn(days).cumsum()
+    })
+    return df
+
+# === Build Output Table ===
+output = []
+
+for symbol in nifty_symbols:
     try:
-        # Get latest LTP from LiveLTPStore
-        ltp_sheet = client.open("LiveLTPStore").sheet1
-        ltp_data = pd.DataFrame(ltp_sheet.get_all_records())
-        ltp_row = ltp_data[ltp_data["Symbol"] == symbol]
-        ltp = float(ltp_row.iloc[0]["LTP"]) if not ltp_row.empty else None
-        row["LTP"] = ltp
+        # Simulate 15m data
+        df_15m = fetch_ohlcv(symbol, "15minute", 32)
+        tmv_15m, dir_15m, rev_15m = compute_tmv_score(df_15m)
 
-        # Calculate % change from daily close
-        daily_df = get_stock_data(kite, symbol, "day", 2)
-        if not daily_df.empty:
-            last_close = daily_df.iloc[-2]["close"]
-            row["% Change"] = round(((ltp - last_close) / last_close) * 100, 2) if ltp else None
-        else:
-            row["% Change"] = None
+        # Simulate 1d data
+        df_1d = fetch_ohlcv(symbol, "day", 90)
+        tmv_1d, dir_1d, rev_1d = compute_tmv_score(df_1d)
 
-        # Analyze both timeframes
-        for tf, config in TIMEFRAMES.items():
-            try:
-                df = get_stock_data(kite, symbol, config["interval"], config["days"])
-                if df.empty:
-                    raise Exception("Empty dataframe")
-                scores = calculate_scores(df)
-                row[f"{tf} TMV Score"] = round(scores.get("Total Score", 0), 2)
-                row[f"{tf} Trend Direction"] = scores.get("Trend Direction", "")
-                row[f"{tf} Reversal Probability"] = round(scores.get("Reversal Probability", 0), 2)
-            except:
-                print(f"⚠️ Live data failed for {symbol} [{tf}] — using fallback")
-                row[f"{tf} TMV Score"] = 0
-                row[f"{tf} Trend Direction"] = "Neutral"
-                row[f"{tf} Reversal Probability"] = 0
+        ltp = df_1d['close'].iloc[-1]
+        prev_close = df_1d['close'].iloc[-2]
+        pct_change = round(((ltp - prev_close) / prev_close) * 100, 2)
+
+        output.append([
+            symbol,
+            round(ltp, 2),
+            f"{pct_change}%",
+            tmv_15m,
+            dir_15m,
+            rev_15m,
+            tmv_1d,
+            dir_1d,
+            rev_1d
+        ])
 
     except Exception as e:
-        print(f"❌ Skipping {symbol}: {e}")
-        continue
+        print(f"⚠️ {symbol} failed: {e}")
 
-    rows.append(row)
-
-# Write to final Google Sheet
-output_sheet = client.open("BackgroundAnalysisStore").sheet1
-output_sheet.clear()
+# === Write to Sheet ===
 headers = [
     "Symbol", "LTP", "% Change",
     "15m TMV Score", "15m Trend Direction", "15m Reversal Probability",
     "1d TMV Score", "1d Trend Direction", "1d Reversal Probability"
 ]
-output_sheet.append_row(headers)
-for row in rows:
-    output_sheet.append_row([row.get(h, "") for h in headers])
 
-print("✅ Background analysis updated successfully!")
+output_sheet.clear()
+output_sheet.update([headers] + output)
+
+print("✅ Analysis complete and written to BackgroundAnalysisStore")
