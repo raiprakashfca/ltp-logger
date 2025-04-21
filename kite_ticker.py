@@ -2,71 +2,106 @@ import os
 import base64
 import json
 import time
-import logging
+import datetime
+import pandas as pd
 import gspread
-from kiteconnect import KiteConnect, KiteTicker
+from kiteconnect import KiteTicker, KiteConnect
 from oauth2client.service_account import ServiceAccountCredentials
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# === 1. Load Google Sheets Credentials from BASE64 env variable ===
+encoded_creds = os.getenv("GSPREAD_CREDENTIALS_JSON")
 
-# Load Google Sheet Credentials from BASE64
-base64_creds = os.environ.get("GSPREAD_CREDENTIALS_JSON")
-if not base64_creds:
-    raise Exception("Missing GSPREAD_CREDENTIALS_JSON in environment variables")
+if not encoded_creds:
+    raise Exception("❌ GSPREAD_CREDENTIALS_JSON not found in environment variables.")
 
-json_creds = json.loads(base64.b64decode(base64_creds).decode("utf-8"))
+try:
+    decoded_creds = base64.b64decode(encoded_creds).decode("utf-8")
+    creds_dict = json.loads(decoded_creds)
+except Exception as e:
+    raise Exception("❌ Failed to decode GSPREAD_CREDENTIALS_JSON: " + str(e))
+
+# === 2. Authenticate Google Sheets ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(json_creds, scope)
-client = gspread.authorize(credentials)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+client = gspread.authorize(creds)
 
-# Read API credentials from sheet
+# === 3. Load Tokens ===
 token_sheet = client.open("ZerodhaTokenStore").sheet1
-api_key, api_secret, access_token = token_sheet.get_all_values()[0]
+tokens_row = token_sheet.get_all_values()[0][:3]  # Take only first 3 (ignore timestamp)
+api_key, api_secret, access_token = tokens_row
 
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# Instruments to subscribe
-symbols = [row[0] for row in client.open("LiveLTPStore").sheet1.get_all_values()[1:]]
-instruments = []
-all_instruments = kite.instruments("NSE")
+# === 4. Fetch instrument tokens for NIFTY 50 ===
+nifty_50 = [
+    "RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "KOTAKBANK", "SBIN", "AXISBANK",
+    "LT", "ITC", "HINDUNILVR", "BAJFINANCE", "ASIANPAINT", "BHARTIARTL", "HCLTECH",
+    "WIPRO", "MARUTI", "SUNPHARMA", "HDFC", "ADANIENT", "ADANIPORTS", "TITAN",
+    "ULTRACEMCO", "TECHM", "POWERGRID", "JSWSTEEL", "COALINDIA", "NTPC", "ONGC",
+    "BPCL", "GRASIM", "DIVISLAB", "BRITANNIA", "CIPLA", "TATASTEEL", "BAJAJFINSV",
+    "SBILIFE", "DRREDDY", "HEROMOTOCO", "M&M", "APOLLOHOSP", "BAJAJ-AUTO", "EICHERMOT",
+    "HDFCLIFE", "HINDALCO", "INDUSINDBK", "SHREECEM", "NESTLEIND", "TATAMOTORS"
+]
 
-for symbol in symbols:
-    try:
-        instrument_token = next(item["instrument_token"] for item in all_instruments if item["tradingsymbol"] == symbol)
-        instruments.append(instrument_token)
-    except StopIteration:
-        logging.warning(f"Symbol {symbol} not found in instrument list")
+instruments = kite.instruments("NSE")
+symbol_to_token = {
+    inst["tradingsymbol"]: inst["instrument_token"]
+    for inst in instruments if inst["tradingsymbol"] in nifty_50
+}
 
-# WebSocket LTP Ticker
-ltp_sheet = client.open("LiveLTPStore").sheet1
-kite_ticker = KiteTicker(api_key, access_token)
+# === 5. Prepare KiteTicker for live streaming ===
+kws = KiteTicker(api_key, access_token)
+
+# === 6. Open target Google Sheet to write LTPs ===
+sheet = client.open("LiveLTPStore").sheet1
+sheet.update("A1:B1", [["Symbol", "LTP"]])  # Clear headers
+
+# === 7. WebSocket handlers ===
+ltp_map = {}
 
 def on_ticks(ws, ticks):
-    data = ltp_sheet.get_all_records()
-    updated = 0
+    global ltp_map
     for tick in ticks:
-        for i, row in enumerate(data):
-            if row["Token"] == tick["instrument_token"]:
-                ltp_sheet.update_cell(i + 2, 3, tick["last_price"])  # LTP column
-                updated += 1
-    logging.info(f"Updated {updated} rows")
+        token = tick['instrument_token']
+        for sym, tok in symbol_to_token.items():
+            if tok == token:
+                ltp = tick['last_price']
+                ltp_map[sym] = ltp
+                break
 
 def on_connect(ws, response):
-    logging.info("WebSocket connected")
-    ws.subscribe(instruments)
+    print("✅ Connected to WebSocket.")
+    ws.subscribe(list(symbol_to_token.values()))
+    ws.set_mode(ws.MODE_LTP, list(symbol_to_token.values()))
 
 def on_close(ws, code, reason):
-    logging.warning(f"WebSocket closed: {reason}")
+    print(f"⚠️ WebSocket closed: {code} {reason}")
 
-kite_ticker.on_ticks = on_ticks
-kite_ticker.on_connect = on_connect
-kite_ticker.on_close = on_close
+def on_error(ws, code, reason):
+    print(f"❌ Error: {code}, {reason}")
 
-logging.info("Starting WebSocket...")
-kite_ticker.connect(threaded=True)
+# === 8. Periodic Writer to Google Sheet ===
+def log_to_gsheet_every(interval=5):
+    while True:
+        rows = [[sym, ltp_map.get(sym, "")] for sym in nifty_50]
+        sheet.update("A2", rows)
+        print("✅ Updated LiveLTPStore:", datetime.datetime.now().strftime("%H:%M:%S"))
+        time.sleep(interval)
 
-# Keep script alive
-while True:
-    time.sleep(30)
+# === 9. Run both WebSocket and Sheet logger ===
+if __name__ == "__main__":
+    from threading import Thread
+
+    kws.on_ticks = on_ticks
+    kws.on_connect = on_connect
+    kws.on_close = on_close
+    kws.on_error = on_error
+
+    writer_thread = Thread(target=log_to_gsheet_every, daemon=True)
+    writer_thread.start()
+
+    kws.connect(threaded=True)
+
+    while True:
+        time.sleep(1)
