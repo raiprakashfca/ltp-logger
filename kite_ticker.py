@@ -1,79 +1,70 @@
-import json
 import os
+import json
 import time
+import logging
 import pandas as pd
 from kiteconnect import KiteConnect, KiteTicker
+from google.oauth2.service_account import Credentials
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
-# Load Zerodha credentials from Google Sheet via environment variable
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = json.loads(os.environ["GSPREAD_CREDENTIALS_JSON"])
-client = gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds, scope))
+# --- Load credentials from environment variable ---
+creds_dict = json.loads(os.environ["GSPREAD_CREDENTIALS_JSON"])
 
-# Fetch tokens from ZerodhaTokenStore
-token_sheet = client.open("ZerodhaTokenStore").sheet1
-tokens = token_sheet.get_all_values()[0]
-api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
+# --- Setup Google Sheets client ---
+scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+gc = gspread.authorize(credentials)
+
+# --- Sheet setup ---
+sheet = gc.open("LiveLTPStore").sheet1
+
+# --- Zerodha API credentials ---
+api_key = os.environ["Z_API_KEY"]
+access_token = os.environ["Z_ACCESS_TOKEN"]
 
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
-
-# Initialize ticker
 kws = KiteTicker(api_key, access_token)
 
-# Define symbols to track
-symbols = [
-    "NSE:NIFTY 50", "NSE:RELIANCE", "NSE:INFY", "NSE:TCS", "NSE:ICICIBANK",
-    "NSE:HDFCBANK", "NSE:SBIN", "NSE:BHARTIARTL"
-]
-
-# Get instrument tokens
+# --- Stocks to track ---
+symbols = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN"]
 instruments = kite.instruments()
-token_map = {}
-for sym in symbols:
-    try:
-        seg, tradingsym = sym.split(":")
-        token = next(i["instrument_token"] for i in instruments if i["exchange"] == seg and i["tradingsymbol"] == tradingsym)
-        token_map[token] = tradingsym
-    except StopIteration:
-        print(f"⚠️ Token not found for {sym}")
+symbol_to_token = {
+    s['tradingsymbol']: s['instrument_token']
+    for s in instruments
+    if s['tradingsymbol'] in symbols and s['exchange'] == 'NSE'
+}
+tokens = list(symbol_to_token.values())
 
 ltp_data = {}
 
-# On tick event
+# --- Callback ---
 def on_ticks(ws, ticks):
-    global ltp_data
     for tick in ticks:
-        token = tick["instrument_token"]
-        tradingsym = token_map.get(token)
-        if tradingsym:
-            ltp = tick.get("last_price")
-            ltp_data[tradingsym] = ltp
-            print(f"{tradingsym}: {ltp}")
-
-    if ltp_data:
-        df = pd.DataFrame(list(ltp_data.items()), columns=["Symbol", "LTP"])
-        try:
-            sheet = client.open("LiveLTPStore").sheet1
-            sheet.clear()
-            sheet.update([df.columns.values.tolist()] + df.values.tolist())
-            print("✅ Google Sheet updated with live LTPs.")
-        except Exception as e:
-            print(f"⚠️ Sheet update failed: {e}")
+        for sym, tok in symbol_to_token.items():
+            if tick['instrument_token'] == tok:
+                ltp_data[sym] = tick['last_price']
+    update_google_sheet()
 
 def on_connect(ws, response):
-    print("✅ WebSocket connected. Subscribing to instruments...")
-    ws.subscribe(list(token_map.keys()))
+    ws.subscribe(tokens)
+    ws.set_mode(ws.MODE_LTP, tokens)
 
-def on_close(ws, code, reason):
-    print(f"🔌 WebSocket closed: {code} - {reason}")
+def update_google_sheet():
+    try:
+        rows = [[sym, ltp_data.get(sym, "")] for sym in symbols]
+        sheet.clear()
+        sheet.update([["Symbol", "LTP"]] + rows)
+        print("✅ Sheet updated")
+    except Exception as e:
+        logging.error(f"Sheet update failed: {e}")
 
-# Register callbacks
+# --- Start ticker ---
 kws.on_ticks = on_ticks
 kws.on_connect = on_connect
-kws.on_close = on_close
 
-# Start WebSocket
-print("🚀 Starting LTP stream...")
-kws.connect(threaded=False)
+print("📡 Starting WebSocket...")
+kws.connect(threaded=True)
+
+while True:
+    time.sleep(30)
