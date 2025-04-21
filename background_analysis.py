@@ -1,63 +1,72 @@
-import json
 import pandas as pd
+import json
+import datetime
+from kiteconnect import KiteConnect
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from kiteconnect import KiteConnect
 from utils.zerodha import get_kite, get_stock_data
 from utils.indicators import calculate_scores
 
-# Authorize Google Sheets access
+# Load Google Sheet credentials
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 with open("zerodhatokensaver-1b53153ffd25.json") as f:
     creds_dict = json.load(f)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Read Zerodha token
+# Zerodha tokens
 token_sheet = client.open("ZerodhaTokenStore").sheet1
-tokens = token_sheet.get_all_values()[0]
-api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
+tokens = token_sheet.get_all_values()[0][:3]
+api_key, api_secret, access_token = tokens
 
 kite = get_kite(api_key, access_token)
 
-# Read list of symbols from LTP sheet
-ltp_sheet = client.open("LiveLTPStore").sheet1
-ltp_data = pd.DataFrame(ltp_sheet.get_all_records())
-symbols = ltp_data["Symbol"].tolist()
+# Detect offline mode based on NSE market status
+market_open = datetime.datetime.now().time() < datetime.time(15, 30)
+
+# Use historical to_date if market is closed
+today = datetime.date.today()
+to_date = today if market_open else today - datetime.timedelta(days=1)
 
 TIMEFRAMES = {
-    "15m": {"interval": "15minute", "days": 5},
-    "1d": {"interval": "day", "days": 90},
+    "15m": {"interval": "15minute", "days": 5, "from": to_date - datetime.timedelta(days=5)},
+    "1d": {"interval": "day", "days": 90, "from": to_date - datetime.timedelta(days=90)},
 }
 
-all_data = []
+symbols = [
+    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL", "LT", "AXISBANK", "ITC",
+    "KOTAKBANK", "HINDUNILVR", "BAJFINANCE", "WIPRO", "ASIANPAINT", "TECHM", "HCLTECH", "MARUTI",
+    "TITAN", "ULTRACEMCO", "SUNPHARMA", "NESTLEIND", "POWERGRID", "JSWSTEEL", "TATAMOTORS",
+    "ADANIENT", "ADANIPORTS", "CIPLA", "DIVISLAB", "NTPC", "BPCL", "BAJAJFINSV", "BAJAJ-AUTO",
+    "GRASIM", "HEROMOTOCO", "COALINDIA", "BRITANNIA", "HINDALCO", "EICHERMOT", "SBILIFE", "ONGC",
+    "UPL", "TATASTEEL", "INDUSINDBK", "ICICIPRULI", "DRREDDY", "HDFCLIFE"
+]
+
+output_rows = []
 
 for symbol in symbols:
     row = {"Symbol": symbol}
-    live_row = ltp_data[ltp_data["Symbol"] == symbol]
-    if not live_row.empty:
-        row["LTP"] = float(live_row.iloc[0]["LTP"])
-        row["Close"] = float(live_row.iloc[0].get("Prev Close", 0))
-        row["% Change"] = round(((row["LTP"] - row["Close"]) / row["Close"]) * 100, 2) if row["Close"] else 0
-
-    for label, config in TIMEFRAMES.items():
-        df = get_stock_data(kite, symbol, config["interval"], config["days"])
+    for tf, cfg in TIMEFRAMES.items():
+        df = get_stock_data(kite, symbol, cfg["interval"], cfg["days"], from_date=cfg["from"], to_date=to_date)
         if not df.empty:
             try:
                 result = calculate_scores(df)
-                for key, value in result.items():
-                    adjusted_key = "TMV Score" if key == "Total Score" else key
-                    row[f"{label} | {adjusted_key}"] = value
+                row[f"{tf} TMV Score"] = round(result["Total Score"], 2)
+                row[f"{tf} Trend Direction"] = result["Trend Direction"]
+                row[f"{tf} Reversal Probability"] = round(result["Reversal Probability"], 2)
+                if tf == "1d":
+                    row["LTP"] = float(df["close"].iloc[-1])
+                    row["% Change"] = round(((df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2]) * 100, 2)
             except Exception as e:
-                print(f"Error processing {symbol} [{label}]: {e}")
-    all_data.append(row)
+                print(f"❌ {symbol} ({tf}) error: {e}")
+    output_rows.append(row)
 
-# Upload to Google Sheet
-result_df = pd.DataFrame(all_data)
-try:
-    output_sheet = client.open("Stock Rankings").worksheet("Precomputed")
-    output_sheet.clear()
-    output_sheet.update([result_df.columns.values.tolist()] + result_df.values.tolist())
-    print("✅ Precomputed scores updated to Google Sheet.")
-except Exception as e:
-    print(f"❌ Sheet update failed: {e}")
+final_df = pd.DataFrame(output_rows)
+
+# Push to sheet
+sheet = client.open("BackgroundAnalysisStore").sheet1
+sheet.clear()
+sheet.update(
+    [final_df.columns.values.tolist()] + final_df.values.tolist()
+)
+print("✅ Sheet updated.")
