@@ -8,7 +8,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from utils.indicators import calculate_scores
 
 # ========== Setup ==========
-
+# Trigger rebuild
 # Load secrets from base64 if using Render environment
 if "GSPREAD_CREDENTIALS_JSON" in os.environ:
     creds_dict = json.loads(
