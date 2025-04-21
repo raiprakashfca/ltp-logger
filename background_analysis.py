@@ -1,71 +1,117 @@
 import os
 import json
-import base64
 import pandas as pd
+from datetime import datetime, timedelta
+from kiteconnect import KiteConnect
 import gspread
-from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-from utils.zerodha import get_kite, get_stock_data
 from utils.indicators import calculate_scores
 
-# Authenticate with Google Sheets using BASE64 environment variable
+# ========== Setup ==========
+
+# Load secrets from base64 if using Render environment
+if "GSPREAD_CREDENTIALS_JSON" in os.environ:
+    creds_dict = json.loads(
+        os.environ["GSPREAD_CREDENTIALS_JSON"]
+    )
+else:
+    with open("zerodhatokensaver-1b53153ffd25.json") as f:
+        creds_dict = json.load(f)
+
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-encoded_credentials = os.environ.get("GSPREAD_CREDENTIALS_JSON")
-decoded_json = json.loads(base64.b64decode(encoded_credentials).decode())
-creds = ServiceAccountCredentials.from_json_keyfile_dict(decoded_json, scope)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Load Zerodha token
+# Read tokens
 token_sheet = client.open("ZerodhaTokenStore").sheet1
 tokens = token_sheet.get_all_values()[0]
-api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
+api_key, api_secret, access_token = tokens[:3]
 
-# Set up Kite
-kite = get_kite(api_key, access_token)
+kite = KiteConnect(api_key=api_key)
+kite.set_access_token(access_token)
 
-# Output Google Sheet
-output_sheet = client.open("BackgroundAnalysisStore").sheet1
+# Timeframes and target sheet
+TIMEFRAMES = {
+    "15m": {"interval": "15minute"},
+    "1d": {"interval": "day"}
+}
+TARGET_SHEET = "BackgroundAnalysisStore"
 
-# Stocks to track
+# Define list of NIFTY 50 stocks
 symbols = [
-    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL",
-    "ITC", "LT", "AXISBANK", "KOTAKBANK", "ASIANPAINT", "MARUTI", "ULTRACEMCO",
-    "SUNPHARMA", "WIPRO", "TITAN", "HCLTECH", "TECHM", "BAJFINANCE", "HINDUNILVR",
-    "NESTLEIND", "BAJAJFINSV", "POWERGRID", "NTPC", "ONGC", "JSWSTEEL", "GRASIM",
-    "HINDALCO", "CIPLA", "DRREDDY", "ADANIENT", "ADANIPORTS", "COALINDIA", "TATASTEEL",
-    "UPL", "BPCL", "BRITANNIA", "DIVISLAB", "SBILIFE", "HEROMOTOCO", "EICHERMOT", "BAJAJ-AUTO"
+    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL", "AXISBANK", "ITC", "KOTAKBANK",
+    "LT", "HCLTECH", "MARUTI", "TITAN", "ASIANPAINT", "SUNPHARMA", "NESTLEIND", "ULTRACEMCO", "BAJFINANCE", "HINDUNILVR",
+    "WIPRO", "BAJAJFINSV", "POWERGRID", "NTPC", "ONGC", "COALINDIA", "TATASTEEL", "JSWSTEEL", "TECHM", "CIPLA",
+    "DRREDDY", "DIVISLAB", "GRASIM", "ADANIENT", "ADANIPORTS", "BPCL", "BRITANNIA", "EICHERMOT", "HINDALCO", "HEROMOTOCO",
+    "BAJAJ-AUTO", "SHREECEM", "INDUSINDBK", "SBILIFE", "APOLLOHOSP", "ICICIPRULI", "HDFCLIFE", "UPL", "M&M", "TATAMOTORS"
 ]
 
-TIMEFRAMES = {
-    "15m": {"interval": "15minute", "days": 5},
-    "1d": {"interval": "day", "days": 90}
-}
+# ========== Helper Functions ==========
 
-results = []
+def get_instrument_token(kite, symbol):
+    instruments = kite.instruments()
+    for ins in instruments:
+        if ins['tradingsymbol'] == symbol and ins['exchange'] == 'NSE':
+            return ins['instrument_token']
+    raise Exception(f"Token not found for {symbol}")
 
+def get_stock_data(kite, symbol, interval):
+    today = datetime.now()
+
+    # Define historical range
+    if interval == "15minute":
+        from_date = today - timedelta(days=7)
+    elif interval == "day":
+        from_date = today - timedelta(days=130)
+    else:
+        from_date = today - timedelta(days=30)
+
+    try:
+        data = kite.historical_data(
+            instrument_token=get_instrument_token(kite, symbol),
+            from_date=from_date,
+            to_date=today,
+            interval=interval,
+            continuous=False
+        )
+        df = pd.DataFrame(data)
+        df.rename(columns={"date": "date"}, inplace=True)
+        return df
+    except Exception as e:
+        print(f"⚠️ Error fetching data for {symbol} ({interval}): {e}")
+        return pd.DataFrame()
+
+# ========== Analysis ==========
+
+rows = []
 for symbol in symbols:
     row = {"Symbol": symbol}
     try:
-        for tf, config in TIMEFRAMES.items():
-            df = get_stock_data(kite, symbol, config["interval"], config["days"])
+        for tf_label, tf_config in TIMEFRAMES.items():
+            df = get_stock_data(kite, symbol, tf_config["interval"])
             if df.empty:
-                raise ValueError("No data returned for", symbol)
-            scores = calculate_scores(df)
-            row[f"{tf} TMV Score"] = round(scores.get("Total Score", 0), 2)
-            row[f"{tf} Trend Direction"] = scores.get("Trend Direction", "-")
-            row[f"{tf} Reversal Probability"] = round(scores.get("Reversal Probability", 0), 2)
-        row["LTP"] = df["close"].iloc[-1]
-        row["% Change"] = round((df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2] * 100, 2)
-        results.append(row)
+                continue
+            result = calculate_scores(df)
+            row[f"{tf_label} TMV Score"] = round(result["TMV Score"], 2)
+            row[f"{tf_label} Trend Direction"] = result["Trend Direction"]
+            row[f"{tf_label} Reversal Probability"] = round(result["Reversal Probability"], 2)
+        # Get last close price and LTP from daily data
+        if not df.empty:
+            row["LTP"] = df.iloc[-1]["close"]
+            row["% Change"] = round(((df.iloc[-1]["close"] - df.iloc[-2]["close"]) / df.iloc[-2]["close"]) * 100, 2)
     except Exception as e:
-        print(f"Error processing {symbol}: {e}")
-        continue
+        print(f"⚠️ Error processing {symbol}: {e}")
+    rows.append(row)
 
-# Write to Google Sheet
-if results:
-    df = pd.DataFrame(results)
-    output_sheet.clear()
-    output_sheet.update([df.columns.values.tolist()] + df.values.tolist())
-    print(f"✅ Analysis complete. {len(df)} stocks updated at {datetime.now()}")
-else:
-    print("⚠️ No data processed.")
+# ========== Push to Google Sheets ==========
+
+try:
+    sheet = client.open(TARGET_SHEET).sheet1
+    sheet.clear()
+    headers = list(rows[0].keys())
+    sheet.append_row(headers)
+    for row in rows:
+        sheet.append_row([row.get(col, "") for col in headers])
+    print("✅ Sheet updated successfully.")
+except Exception as e:
+    print(f"❌ Failed to update Google Sheet: {e}")
