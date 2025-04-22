@@ -1,79 +1,72 @@
-
-import os
 import json
+import os
 import pandas as pd
+import numpy as np
 from datetime import datetime
-import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import gspread
 from utils.zerodha import get_kite, get_stock_data
 from utils.indicators import calculate_scores
 
-# Load Google Sheet credentials from environment
-creds_dict = json.loads(os.environ.get("GSPREAD_CREDENTIALS_JSON", "{}"))
+# ✅ Read from environment variable, not from file
+creds_dict = json.loads(os.environ["GSPREAD_CREDENTIALS_JSON"])
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# Get token details
+# Sheets
 token_sheet = client.open("ZerodhaTokenStore").sheet1
 tokens = token_sheet.get_all_values()[0]
-api_key, api_secret, access_token = tokens[:3]
+api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
 
-# Get Kite object
+background_sheet = client.open("BackgroundAnalysisStore").sheet1
+
 kite = get_kite(api_key, access_token)
 
-# Timeframes
+symbols = [
+    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL",
+    "ITC", "KOTAKBANK", "LT", "AXISBANK", "MARUTI", "ASIANPAINT", "SUNPHARMA",
+    "HINDUNILVR", "BAJFINANCE", "WIPRO", "TECHM", "ULTRACEMCO", "POWERGRID",
+    "NTPC", "ONGC", "JSWSTEEL", "TATASTEEL", "COALINDIA", "GRASIM", "NESTLEIND",
+    "CIPLA", "DRREDDY", "TITAN", "ADANIENT", "ADANIPORTS", "BPCL", "BRITANNIA",
+    "EICHERMOT", "HEROMOTOCO", "HINDALCO", "DIVISLAB", "INDUSINDBK", "BAJAJFINSV",
+    "SBILIFE", "SHREECEM", "TATAMOTORS", "HCLTECH", "BAJAJ_AUTO", "APOLLOHOSP",
+    "M&M"
+]
+
 TIMEFRAMES = {
     "15m": {"interval": "15minute", "days": 5},
     "1d": {"interval": "day", "days": 90},
 }
 
-symbols = [
-    "RELIANCE", "INFY", "TCS", "ICICIBANK", "HDFCBANK", "SBIN", "BHARTIARTL", "LT",
-    "KOTAKBANK", "ITC", "ASIANPAINT", "HCLTECH", "WIPRO", "SUNPHARMA", "NESTLEIND",
-    "AXISBANK", "MARUTI", "BAJFINANCE", "TECHM", "TITAN", "ULTRACEMCO", "POWERGRID",
-    "COALINDIA", "NTPC", "ONGC", "GRASIM", "ADANIENT", "ADANIPORTS", "BPCL", "CIPLA",
-    "DIVISLAB", "DRREDDY", "EICHERMOT", "HINDALCO", "HEROMOTOCO", "JSWSTEEL",
-    "M&M", "BAJAJFINSV", "BAJAJ-AUTO", "BRITANNIA", "HINDUNILVR", "TATACONSUM",
-    "TATASTEEL", "SBILIFE", "SHREECEM", "HDFCLIFE", "ICICIPRULI", "INDUSINDBK",
-    "APOLLOHOSP", "UPL"
-]
-
-all_data = []
+data = []
 
 for symbol in symbols:
     row = {"Symbol": symbol}
-    for label, config in TIMEFRAMES.items():
-        try:
+    try:
+        for label, config in TIMEFRAMES.items():
             df = get_stock_data(kite, symbol, config["interval"], config["days"])
-            if not df.empty:
-                scores = calculate_scores(df)
-                for key, value in scores.items():
-                    adjusted_key = "TMV Score" if key == "Total Score" else key
-                    row[f"{label} {adjusted_key}"] = value
-                row["LTP"] = df['close'].iloc[-1]
-                if "1d close" not in row and "1d TMV Score" in row:
-                    row["1d close"] = df['close'].iloc[-2] if len(df) > 1 else df['close'].iloc[-1]
-        except Exception as e:
-            print(f"Error with {symbol} {label}: {e}")
-    if "LTP" in row and "1d close" in row:
-        row["% Change"] = ((row["LTP"] - row["1d close"]) / row["1d close"]) * 100
-    all_data.append(row)
-
-df = pd.DataFrame(all_data)
-df = df.drop(columns=["1d close"], errors="ignore")
-df["% Change"] = df["% Change"].apply(lambda x: f"{x:.2f}%")
-
-# Reorder columns
-column_order = ["Symbol", "LTP", "% Change"] + [col for col in df.columns if col not in ["Symbol", "LTP", "% Change"]]
-df = df[column_order]
+            if df.empty:
+                continue
+            result = calculate_scores(df)
+            row[f"{label} TMV Score"] = round(result["TMV Score"], 2)
+            row[f"{label} Trend Direction"] = result["Trend Direction"]
+            row[f"{label} Reversal Probability"] = round(result["Reversal Probability"], 2)
+        ltp = df["close"].iloc[-1]
+        previous_close = df["close"].iloc[-2] if len(df) >= 2 else ltp
+        pct_change = ((ltp - previous_close) / previous_close) * 100
+        row["LTP"] = round(ltp, 2)
+        row["% Change"] = f"{pct_change:.2f}%"
+        data.append(row)
+    except Exception as e:
+        print(f"❌ Error processing {symbol}: {e}")
 
 # Upload to Google Sheet
-try:
-    sheet = client.open("BackgroundAnalysisStore").sheet1
-    sheet.clear()
-    sheet.update([df.columns.values.tolist()] + df.values.tolist())
-    print("✅ Background data uploaded.")
-except Exception as e:
-    print(f"❌ Failed to upload: {e}")
+if data:
+    df_final = pd.DataFrame(data)
+    background_sheet.clear()
+    background_sheet.update([df_final.columns.values.tolist()] + df_final.values.tolist())
+    print("✅ Background analysis uploaded to sheet.")
+else:
+    print("⚠️ No data available to upload.")
