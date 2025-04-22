@@ -1,14 +1,10 @@
 # 🛠 Trigger clean rebuild on Render (2025-04-22)
-
+import json
 import pandas as pd
 import numpy as np
-import json
+from pathlib import Path  # ✅ Add this line
 import gspread
-from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
-from utils.zerodha import get_kite, get_stock_data
-from utils.indicators import calculate_scores
-
 # Authenticate with Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_dict = json.loads(Path("gspread_credentials.json").read_text())
