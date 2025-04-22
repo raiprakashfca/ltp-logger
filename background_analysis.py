@@ -2,9 +2,10 @@
 import json
 import pandas as pd
 import numpy as np
-from pathlib import Path  # ✅ Add this line
+from pathlib import Path  # ✅ REQUIRED
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
 # Authenticate with Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_dict = json.loads(Path("gspread_credentials.json").read_text())
