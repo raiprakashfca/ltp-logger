@@ -1,32 +1,66 @@
-
-import gspread
-import streamlit as st
-from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
+import numpy as np
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
+import os
+import warnings
 
-def update_google_sheet(dataframe, sheet_name, worksheet_name):
+# === Safe header structure ===
+EXPECTED_HEADERS = [
+    "Symbol", "LTP", "% Change",
+    "15m TMV Score", "15m Trend Direction", "15m Reversal Probability",
+    "1d TMV Score", "1d Trend Direction", "1d Reversal Probability"
+]
+
+# === Authenticate Google Sheets ===
+def authenticate_gsheets():
     try:
-        gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-        sh = gc.open(sheet_name)
-        worksheet = sh.worksheet(worksheet_name)
-        worksheet.clear()
-        worksheet.update([dataframe.columns.values.tolist()] + dataframe.values.tolist())
-        st.success("✅ Sheet updated successfully!")
-    except Exception as e:
-        st.error(f"❌ Failed to update Google Sheet: {e}")
+        import streamlit as st
+        creds_dict = st.secrets["gcp_service_account"]
+    except Exception:
+        import toml
+        creds_dict = toml.load(".streamlit/secrets.toml")["gcp_service_account"]
 
-# Example usage:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(credentials)
+
+# === Append row safely ===
+def append_row_to_background_analysis_store(row_data):
+    try:
+        gc = authenticate_gsheets()
+        sh = gc.open("BackgroundAnalysisStore")
+        ws = sh.worksheet("LiveScores")
+
+        # Validate headers
+        actual_headers = ws.row_values(1)
+        if actual_headers != EXPECTED_HEADERS:
+            raise ValueError("Google Sheet headers do not match expected format. Please fix them manually.")
+
+        # Prepare row values in exact order
+        row = [row_data.get(col, "") for col in EXPECTED_HEADERS]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+
+        print("✅ Row appended successfully.")
+    except Exception as e:
+        print(f"❌ Failed to append row to Google Sheet: {e}")
+
+# === Example logic to generate dummy row ===
+def run_background_analysis():
+    now = datetime.now().strftime("%H:%M:%S")
+    dummy_row = {
+        "Symbol": "NIFTY",
+        "LTP": 22200.45,
+        "% Change": 0.42,
+        "15m TMV Score": 78,
+        "15m Trend Direction": "Uptrend",
+        "15m Reversal Probability": "Low",
+        "1d TMV Score": 65,
+        "1d Trend Direction": "Neutral",
+        "1d Reversal Probability": "Medium"
+    }
+    append_row_to_background_analysis_store(dummy_row)
+
 if __name__ == "__main__":
-    st.title("🔧 Background Analysis Debug Tool")
-    df = pd.DataFrame({
-        "Symbol": ["RELIANCE", "HDFCBANK"],
-        "LTP": [2800.15, 1601.55],
-        "% Change": [0.52, -0.41],
-        "15m TMV Score": [4, 3],
-        "15m Trend Direction": ["Up", "Flat"],
-        "15m Reversal Probability": [0.15, 0.65],
-        "1d TMV Score": [3, 2],
-        "1d Trend Direction": ["Up", "Down"],
-        "1d Reversal Probability": [0.2, 0.8]
-    })
-    update_google_sheet(df, "BackgroundAnalysisStore", "Sheet1")
+    run_background_analysis()
