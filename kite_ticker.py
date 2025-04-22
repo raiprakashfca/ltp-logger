@@ -1,84 +1,81 @@
+
 import os
 import json
-import base64
 import time
 import logging
 import pandas as pd
-from kiteconnect import KiteConnect, KiteTicker
+import numpy as np
 import gspread
+from kiteconnect import KiteConnect, KiteTicker
 from oauth2client.service_account import ServiceAccountCredentials
+import streamlit as st
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 
-# Decode Google Service Credentials from environment variable
-creds_base64 = os.environ.get("GSPREAD_CREDENTIALS_JSON")
-if not creds_base64:
-    raise ValueError("❌ GSPREAD_CREDENTIALS_JSON not found in environment variables.")
+# Load credentials from Streamlit secrets
+creds_dict = st.secrets["gspread_service_account"]
 
-creds_json = base64.b64decode(creds_base64).decode("utf-8")
-creds_dict = json.loads(creds_json)
-
-# Google Sheets setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client = gspread.authorize(credentials)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+client = gspread.authorize(creds)
 
-# Load tokens from Google Sheet
+# Get API Key and Access Token
 token_sheet = client.open("ZerodhaTokenStore").sheet1
-tokens = token_sheet.get_all_values()[0][:3]  # Only use first 3 values
-api_key, api_secret, access_token = tokens[0], tokens[1], tokens[2]
+api_key, api_secret, access_token = token_sheet.get_all_values()[0][:3]
 
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# Read list of symbols
-ltp_sheet = client.open("LiveLTPStore").sheet1
-symbols = [row[0] for row in ltp_sheet.get_all_values()[1:] if row]  # Ignore header
+# Prepare the LTP sheet
+sheet = client.open("LiveLTPStore").sheet1
+sheet.update("A1:C1", [["Symbol", "LTP", "% Change"]])  # Update header
 
-# Fetch instrument tokens for symbols
-instruments = pd.DataFrame(kite.instruments("NSE"))
+symbols = [row[0] for row in sheet.get_all_values()[1:] if row]
+instrument_dump = kite.instruments("NSE")
 symbol_token_map = {}
-for symbol in symbols:
-    match = instruments[instruments["tradingsymbol"] == symbol]
-    if not match.empty:
-        symbol_token_map[symbol] = int(match.iloc[0]["instrument_token"])
+close_prices = {}
 
-if not symbol_token_map:
-    raise ValueError("❌ No valid symbols found for LTP tracking.")
+for symbol in symbols:
+    try:
+        token = next(i["instrument_token"] for i in instrument_dump if i["tradingsymbol"] == symbol and i["segment"] == "NSE")
+        ltp_data = kite.ltp(f"NSE:{symbol}")
+        close = ltp_data[f"NSE:{symbol}"]["ohlc"]["close"]
+        symbol_token_map[symbol] = token
+        close_prices[symbol] = close
+    except:
+        logging.warning(f"⚠️ Skipping {symbol}: Not found in instrument dump")
 
 tokens = list(symbol_token_map.values())
-
-# Initialize KiteTicker
 kws = KiteTicker(api_key, access_token)
 
-# Setup LTP cache
-latest_ltps = {}
+ltp_data = {}
 
 def on_ticks(ws, ticks):
+    global ltp_data
     for tick in ticks:
-        for sym, token in symbol_token_map.items():
-            if tick["instrument_token"] == token and "last_price" in tick:
-                latest_ltps[sym] = tick["last_price"]
+        for symbol, token in symbol_token_map.items():
+            if tick["instrument_token"] == token:
+                ltp = tick["last_price"]
+                close = close_prices.get(symbol, ltp)
+                pct = ((ltp - close) / close) * 100
+                ltp_data[symbol] = (ltp, pct)
 
-    if latest_ltps:
-        try:
-            rows = [[symbol, latest_ltps.get(symbol, "")] for symbol in symbols]
-            ltp_sheet.update(values=[["Symbol", "LTP"]], range_name="A1:B1")  # ✅ Updated
-            ltp_sheet.update(values=rows, range_name="A2")                    # ✅ Updated
-            logging.info("✅ LTPs updated to Google Sheet.")
-        except Exception as e:
-            logging.warning(f"⚠️ Sheet update failed: {e}")
+        if len(ltp_data) == len(symbol_token_map):
+            rows = [[sym, f"{ltp_data[sym][0]:.2f}", f"{ltp_data[sym][1]:.2f}%"] for sym in symbol_token_map.keys()]
+            try:
+                sheet.update("A2", rows)
+                logging.info("✅ Updated LiveLTPStore")
+            except Exception as e:
+                logging.error(f"❌ Failed to update sheet: {e}")
 
 def on_connect(ws, response):
     ws.subscribe(tokens)
-    logging.info("✅ Subscribed to tokens.")
 
 def on_close(ws, code, reason):
-    logging.warning("⚠️ Connection closed: %s", reason)
+    logging.warning(f"⚠️ Connection closed: {reason}")
 
 def on_error(ws, code, reason):
-    logging.error("❌ WebSocket error: %s", reason)
+    logging.error(f"❌ WebSocket error: {reason}")
 
 kws.on_ticks = on_ticks
 kws.on_connect = on_connect
@@ -88,9 +85,5 @@ kws.on_error = on_error
 logging.info("🚀 Starting Kite Ticker WebSocket...")
 kws.connect(threaded=True)
 
-# Run for 6 hours
-for _ in range(6 * 60):  # Every 60 seconds for 6 hours
+while True:
     time.sleep(60)
-
-kws.close()
-logging.info("🛑 Kite Ticker stopped after session.")
