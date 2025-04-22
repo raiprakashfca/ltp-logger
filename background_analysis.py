@@ -7,17 +7,7 @@ from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 from utils.zerodha import get_kite, get_stock_data
 from utils.indicators import calculate_scores
-# ==================== DEBUG BLOCK START ====================
-st.subheader("🔍 Debug Secrets Check")
-st.write("Secrets keys detected:", list(st.secrets.keys()))
 
-try:
-    service_account_info = dict(st.secrets["gcp_service_account"])
-    st.success("✅ gcp_service_account block found!")
-    st.json(service_account_info)
-except Exception as e:
-    st.error(f"❌ Failed to read gcp_service_account: {e}")
-# ==================== DEBUG BLOCK END ======================
 # Google Sheets setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
